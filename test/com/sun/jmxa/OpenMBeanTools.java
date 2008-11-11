@@ -152,7 +152,7 @@ public class OpenMBeanTools {
 
                 handleElement( writer, "description", ct.getDescription() ) ;
                 for (Object key : ct.keySet() ) {
-                    handleNestedType( writer, (String)key, 
+                    handleNestedType( writer, (String)key,
                         ct.getType((String)key) ) ;
                 }
             } else if (ot instanceof TabularType) {
@@ -218,7 +218,7 @@ public class OpenMBeanTools {
     }
     
     public static void main( String[] args ) {
-        List<Object> x = list( 0, "string", list( 3, 4 ) ) ;
+        // List<Object> x = list( 0, "string", list( 3, 4 ) ) ;
 
         OpenType ot = tab( "tab1", "a tab type", 
             comp( "comp1", "a comp type", 

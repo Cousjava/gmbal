@@ -36,6 +36,7 @@
 
 package com.sun.jmxa.impl ;
 
+import com.sun.jmxa.generic.ClassAnalyzer;
 import java.lang.reflect.Type ;
 
 import java.lang.reflect.AnnotatedElement ;
@@ -45,8 +46,11 @@ import com.sun.jmxa.generic.Pair ;
 import com.sun.jmxa.InheritedAttribute ;
 
 import com.sun.jmxa.generic.DprintUtil;
+import com.sun.jmxa.generic.FacetAccessor;
+import com.sun.jmxa.generic.Predicate;
 import java.lang.annotation.Annotation;
 import java.util.List;
+import java.util.Map;
 
 public interface ManagedObjectManagerInternal extends ManagedObjectManager {
     /** Construct or lookup the TypeConverter for the given type.
@@ -57,7 +61,7 @@ public interface ManagedObjectManagerInternal extends ManagedObjectManager {
     TypeConverter getTypeConverter( Type type ) ;
     
     String getDescription( AnnotatedElement element ) ;
-    
+        
     <T extends Annotation> T getAnnotation( AnnotatedElement element,
         Class<T> type ) ;
 
@@ -78,6 +82,21 @@ public interface ManagedObjectManagerInternal extends ManagedObjectManager {
      * @return The inherited attributes.
      */
     List<InheritedAttribute> getInheritedAttributes( ClassAnalyzer ca ) ;
+    
+    Pair<Map<String,AttributeDescriptor>,Map<String,AttributeDescriptor>>
+        getAttributes( ClassAnalyzer ca ) ;
+    
+    <K,V> void putIfNotPresent( final Map<K,V> map,
+        final K key, final V value ) ;
+        
+    String getStrippedName( Class<?> cls ) ;
+    
+    Predicate<AnnotatedElement> forAnnotation( 
+        final Class<? extends Annotation> annotation ) ;
+    
+    FacetAccessor getFacetAccessor( Object obj ) ;
+    
+    MBeanImpl constructMBean( Object obj, String name ) ;
     
     boolean registrationDebug() ;
     
