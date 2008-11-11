@@ -36,6 +36,7 @@
 
 package com.sun.jmxa.impl ;
 
+import com.sun.jmxa.generic.ClassAnalyzer;
 import java.util.ResourceBundle ;
 import java.util.Map ;
 import java.util.HashMap ;
@@ -52,11 +53,8 @@ import java.lang.annotation.Annotation ;
 
 import java.lang.management.ManagementFactory ;
 
-import javax.management.InstanceNotFoundException;
-import javax.management.MBeanRegistrationException;
 import javax.management.MBeanServer ;
 import javax.management.JMException ;
-import javax.management.MalformedObjectNameException;
 import javax.management.ObjectName ;
 import javax.management.NotificationEmitter;
 
@@ -68,53 +66,84 @@ import com.sun.jmxa.Description ;
 import com.sun.jmxa.IncludeSubclass ;
 import com.sun.jmxa.InheritedAttribute ;
 import com.sun.jmxa.InheritedAttributes ;
+import com.sun.jmxa.ManagedAttribute;
 import com.sun.jmxa.ManagedObjectManager;
+import com.sun.jmxa.ManagedObjectManagerFactory;
 import com.sun.jmxa.generic.DprintUtil;
 import com.sun.jmxa.generic.DumpIgnore;
 import com.sun.jmxa.generic.ObjectUtility;
 import com.sun.jmxa.generic.Predicate;
 import com.sun.jmxa.generic.UnaryFunction;
+import com.sun.jmxa.generic.FacetAccessor ;
+import com.sun.jmxa.generic.FacetAccessorImpl;
+import com.sun.jmxa.generic.Holder;
+import java.lang.reflect.Method;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashSet;
-import java.util.IdentityHashMap;
-import java.util.Set;
+import java.util.SortedSet;
+import java.util.Set ;
+import java.util.TreeSet;
 
 public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
     private final String domain ;
     private ResourceBundle resourceBundle ;
     private MBeanServer server ; 
-    private final Map<Object,ObjectName> objectMap ;
-    private final Map<ObjectName,Object> objectNameMap ;
-    private final Map<Object,DynamicMBeanImpl> objectMBeanMap ;
-    private final Map<Class<?>,DynamicMBeanSkeleton> skeletonMap ;
+    private MBeanTree tree ;
+    private final Map<Class<?>,MBeanSkeleton> skeletonMap ;
     private final Map<Type,TypeConverter> typeConverterMap ;
     private final Map<AnnotatedElement, Map<Class, Annotation>> addedAnnotations ;
-    private final List<String> defaultObjectNameProps ;
+    
     @DumpIgnore
     private DprintUtil dputil = null ;
     private ManagedObjectManager.RegistrationDebugLevel regDebugLevel = 
         ManagedObjectManager.RegistrationDebugLevel.NONE ;
     private boolean runDebugFlag = false ;
-    private final Set<String> typePrefixes = new HashSet<String>() ;
+    
+    private Comparator<String> revComp = new Comparator<String>() {
+        public int compare(String o1, String o2) {
+            return - o1.compareTo( o2 ) ;
+        }
+    } ;
+    
+    // Maintain the list of typePrefixes in reversed sorted order, so that
+    // we strip the longest prefix first.
+    private final SortedSet<String> typePrefixes = new TreeSet<String>( 
+        revComp ) ;
 
     @Override
     public String toString( ) {
-        return "ManagedObjectManagerImpl[domain=" + domain 
-            + ",defaultObjectNameProps=" + defaultObjectNameProps + "]" ;
+        return "ManagedObjectManagerImpl[domain=" + domain + "]" ;
     }
     
-    public ManagedObjectManagerImpl( String domain, List<String> defProps ) {
+    @ManagedObject
+    @Description( "Dummy class used when no root is specified" ) 
+    private static class Root {
+        // No methods: will simply implement an AMX container
+    }
+    
+    public ManagedObjectManagerImpl( 
+        final String domain, 
+        final String rootParentName,
+        final Object rootObject,
+        final String rootName ) {
+        
 	this.domain = domain ;
         resourceBundle = null ;
+
 	server = ManagementFactory.getPlatformMBeanServer() ;
-	objectMap = new IdentityHashMap<Object,ObjectName>() ;
-	objectNameMap = new HashMap<ObjectName,Object>() ;
-        objectMBeanMap = new IdentityHashMap<Object,DynamicMBeanImpl>() ;
-	skeletonMap = new WeakHashMap<Class<?>,DynamicMBeanSkeleton>() ;
+        Object actualRoot = rootObject ;
+        if (actualRoot == null) {
+            actualRoot = new Root() ;
+        }
+        
+	skeletonMap = new WeakHashMap<Class<?>,MBeanSkeleton>() ;
 	typeConverterMap = new WeakHashMap<Type,TypeConverter>() ;
         addedAnnotations = 
             new HashMap<AnnotatedElement, Map<Class, Annotation>>() ;
-        defaultObjectNameProps = new ArrayList<String>( defProps ) ;
+        
+        tree = new MBeanTree( this, domain, rootParentName, "type",
+            actualRoot, rootName ) ;
     }
 
     private static final TypeConverter recursiveTypeMarker = 
@@ -126,19 +155,12 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
         }
         
         try {
-            for (Map.Entry<Object,ObjectName> entry : objectMap.entrySet()) {
-                unregister( entry.getValue() ) ;
-            }
-
-            objectMap.clear() ;
-            objectNameMap.clear() ;
-            objectMBeanMap.clear() ;
+            tree.clear() ;
             skeletonMap.clear() ;
             typeConverterMap.clear() ;
             addedAnnotations.clear() ;
             server = null ;
             resourceBundle = null ;
-            defaultObjectNameProps.clear() ;
         } finally {
             if (registrationDebug()) {
                 dputil.exit() ;
@@ -146,13 +168,13 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
         }
     }
     
-    public synchronized DynamicMBeanSkeleton getSkeleton( Class<?> cls ) {
+    public synchronized MBeanSkeleton getSkeleton( Class<?> cls ) {
         if (registrationDebug()) {
             dputil.enter( "getSkeleton", cls ) ;
         }
         
         try {
-            DynamicMBeanSkeleton result = skeletonMap.get( cls ) ;
+            MBeanSkeleton result = skeletonMap.get( cls ) ;
 
             boolean newSkeleton = false ;
             if (result == null) {
@@ -169,7 +191,7 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
                 result = skeletonMap.get( annotatedClass ) ;
 
                 if (result == null) {
-                    result = new DynamicMBeanSkeleton( annotatedClass, ca, this ) ;
+                    result = new MBeanSkeleton( annotatedClass, ca, this ) ;
                 }
 
                 skeletonMap.put( cls, result ) ;
@@ -203,8 +225,8 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
                     dputil.info( "Creating new TypeConverter" ) ;
                 }
             
-                // Store a TypeConverter impl that throws an exception when acessed.
-                // Used to detect recursive types.
+                // Store a TypeConverter impl that throws an exception when 
+                // acessed.  Used to detect recursive types.
                 typeConverterMap.put( type, recursiveTypeMarker ) ;
 
                 result = TypeConverterImpl.makeTypeConverter( type, this ) ;
@@ -231,12 +253,8 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
         return result ;
     }
 
-    public NotificationEmitter register( Object obj, String... props ) {
-        Map<String,String> map = new HashMap<String,String>() ;
-	return register( obj, Arrays.asList( props ) ) ;
-    }
-
-    private String stripType( String arg ) {
+    public String getStrippedName( Class<?> cls ) {
+        String arg = cls.getName() ;
         for (String str : typePrefixes ) {
             if (arg.startsWith( str ) ) {
                 return arg.substring( str.length() + 1 ) ;
@@ -246,116 +264,68 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
         return arg ;
     }
     
-    private ObjectName makeObjectName( final Object obj, 
-        final DynamicMBeanSkeleton skel, 
-        final List<String> props ) throws MalformedObjectNameException {
+    public synchronized MBeanImpl constructMBean( Object obj, String name ) {
+        MBeanImpl result = null ;
         
         if (registrationDebug()) {
-            dputil.enter( "makeObjectName" ) ;
+            dputil.enter( "constructMean", 
+                "obj=", obj,
+                "name=", name ) ;
         }
         
-        // Construct the key/value pairs for the ObjectName
-        // ObjectName syntax:
-        // domain:key=value,...
-        // where domain is any string not containing * ? or :
-        // where key is any string not containing : = ? * " or ,
-        // where value has been processed by ObjectName.quote
-        // Confusingly, the spec for ObjectName says that order does not
-        // matter, but order greatly affects the behavior of jconsole.
-        // However, it appears that order is presered if new ObjectName(String)
-        // is used: the toString() method should provide all properties in
-        // the same order.
         try {
-            List<String> oknProps ;
-            try {
-                oknProps = skel.getObjectNameProperties(obj) ;
-            } catch (Exception exc) {
-                oknProps = null ;
-            }
-            
+            final Class<?> cls = obj.getClass() ;
+            final MBeanSkeleton skel = getSkeleton( cls ) ;
+
+            String type = skel.getType() ;
             if (registrationDebug()) {
-                dputil.info( "oknProps=" + oknProps ) ;
+                dputil.info( "Stripped type =", type ) ;
             }
+
+            result = new MBeanImpl( skel, obj, server, type ) ;
             
-            List<String> fullProps = new ArrayList<String>() ;
-            StringBuilder objname = new StringBuilder() ;
-            objname.append( domain ) ;
-            objname.append( ':' ) ;
-
-            objname.append( "type=" ) ;
-            objname.append( stripType( skel.getType() ) ) ;
-
-            for (String str : defaultObjectNameProps) {
-                objname.append( ',' ) ;
-                objname.append( str ) ;
-            }
-
-            for (String str : props) {
-                objname.append( ',' ) ;
-                objname.append( str ) ;
-            }        
-
-            for (String str : oknProps ) {
-                objname.append( ',' ) ;
-                objname.append( str ) ;
-            }
-
+            String objName = name ;
+            if (objName == null) {
+                objName = skel.getNameValue( result ) ;
+                if (objName == null) {
+                    objName = type ;
+                }
+            }  
+           
             if (registrationDebug()) {
-                dputil.info( "objname=" + objname ) ;
+                dputil.info( "Name value =", objName ) ;
             }
             
-            return new ObjectName( objname.toString() ) ;
+            result.name( objName ) ;
+        } catch (JMException exc) {
+            if (registrationDebug()) {
+                dputil.exception( "Problem in fetching value of name", exc) ;
+            }
         } finally {
             if (registrationDebug()) {
-                dputil.exit() ;
+                dputil.exit( result ) ;
             }
         }
+        
+        return result ;
     }
-   
+    
     @SuppressWarnings("unchecked")
-    public synchronized NotificationEmitter register( final Object obj, 
-	final List<String> props ) {
+    public synchronized NotificationEmitter register( final Object parent,
+        final Object obj, final String name ) {
 
         if (registrationDebug()) {
-            dputil.enter( "register", "obj=", obj, "props=", props ) ;
+            dputil.enter( "register", 
+                "parent=", parent, 
+                "obj=", obj,
+                "name=", name ) ;
         }
         
         // Construct the MBean
 	try {
-            final Class<?> cls = obj.getClass() ;
-            final DynamicMBeanSkeleton skel = getSkeleton( cls ) ;
-            final DynamicMBeanImpl mbean = new DynamicMBeanImpl( skel, obj ) ;
-
-            final ObjectName oname = makeObjectName( obj, skel, props ) ;
-
-            if (objectMap.containsKey( obj )) {
-                if (registrationDebug()) {
-                    dputil.info( "Object is already registered" ) ;
-                }
-                
-                // XXX I18N
-                throw new IllegalArgumentException(
-                    "Object " + obj + " has already been registered" ) ;
-            }
-
-            if (objectNameMap.containsKey( oname )) {
-                if (registrationDebug()) {
-                    dputil.info( "ObjectName has already been registered" ) ;
-                }
-                
-                throw new IllegalArgumentException(
-                    // XXX I18N
-                    "An Object has already been registered with ObjectName "
-                    + oname ) ;
-            }
-        
-            server.registerMBean( mbean, oname ) ;
+            final MBeanImpl mb = constructMBean( obj, name ) ;
             
-	    objectNameMap.put( oname, obj ) ;
-	    objectMap.put( obj, oname ) ;
-            objectMBeanMap.put( obj, mbean ) ;
-
-            return mbean ;
+            return tree.register( parent, obj, mb) ;
 	} catch (JMException exc) {
 	    throw new IllegalArgumentException( exc ) ;
 	} finally {
@@ -364,32 +334,31 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
             }
         }
     }
+    
+    public synchronized NotificationEmitter register( final Object parent,
+        final Object obj ) {
 
+        return register( parent, obj, null ) ;
+    }
+
+    
+    public NotificationEmitter registerAtRoot(Object obj, String name) {
+        return register( null, obj, name ) ;
+    }
+
+    public NotificationEmitter registerAtRoot(Object obj) {
+        return register( null, obj, null ) ;
+    }
+    
     public synchronized void unregister( Object obj ) {
         if (registrationDebug()) {
             dputil.enter( "unregister", "obj=", obj ) ;
         }
         
         try {
-            ObjectName oname = objectMap.get( obj ) ;
-            if (oname != null) {
-                try {
-                    server.unregisterMBean(oname);
-                } catch (InstanceNotFoundException ex) {
-                    throw new IllegalArgumentException( 
-                        "Could not unregister " + obj, ex ) ;
-                } catch (MBeanRegistrationException ex) {
-                    throw new IllegalArgumentException( 
-                        "Could not unregister " + obj, ex ) ;
-                } finally {
-                    // Make sure obj is removed even if unregisterMBean fails
-                    objectMap.remove( obj ) ;
-                    objectNameMap.remove( oname ) ;
-                    objectMBeanMap.remove( obj ) ;
-                }
-            } else if (registrationDebug()) {
-                dputil.info( obj + " not found" ) ;
-            }
+            tree.unregister( obj ) ;
+        } catch (JMException exc) {
+            throw new IllegalStateException( exc ) ;
         } finally {
             if (registrationDebug()) {
                 dputil.exit() ;
@@ -402,17 +371,16 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
             dputil.enter( "getObjectName", obj ) ;
         }
         
+        ObjectName result = null;
         try {
-            ObjectName result = objectMap.get( obj ) ;
-            if (registrationDebug()) {
-                dputil.info( "result is " + result ) ;
-            }
-            return result ;
+            result = tree.getObjectName( obj ) ;
         } finally {
             if (registrationDebug()) {
-                dputil.exit() ;
+                dputil.exit( result ) ;
             }
         }
+        
+        return result ;
     }
 
     public synchronized Object getObject( ObjectName oname ) {
@@ -420,20 +388,27 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
             dputil.enter( "getObject", oname ) ;
         }
         
+        Object result = null ;
         try {
-            Object result = objectNameMap.get( oname ) ;
-            if (registrationDebug()) {
-                dputil.info( "result is " + result ) ;
-            }
-                
-            return result ;
+            result = tree.getObject( oname ) ;
 	} finally {
             if (registrationDebug()) {
-                dputil.exit() ;
+                dputil.exit( result ) ;
             }
         }
+        
+        return result ;
     }
-
+    
+    public synchronized FacetAccessor getFacetAccessor( Object obj ) {
+        MBeanImpl mb = tree.getMBeanImpl( obj ) ;
+        if (mb != null) {
+            return tree.getFacetAccessor( obj ) ;
+        } else {
+            return new FacetAccessorImpl( obj ) ;
+        }
+    }   
+    
     public synchronized String getDomain() {
 	return domain ;
     }
@@ -446,15 +421,15 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
 	return server ;
     }
 
-    public void setResourceBundle( ResourceBundle rb ) {
+    public synchronized void setResourceBundle( ResourceBundle rb ) {
         this.resourceBundle = rb ;
     }
 
-    public ResourceBundle getResourceBundle() {
+    public synchronized ResourceBundle getResourceBundle() {
         return resourceBundle ;
     }
     
-    public String getDescription( AnnotatedElement element ) {
+    public synchronized String getDescription( AnnotatedElement element ) {
         Description desc = element.getAnnotation( Description.class ) ;
         String result ;
         if (desc == null) {
@@ -472,7 +447,7 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
     }
     
     
-    public void addAnnotation( AnnotatedElement element,
+    public synchronized void addAnnotation( AnnotatedElement element,
         Annotation annotation ) {
         
         if (registrationDebug()) {
@@ -513,7 +488,7 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
     }
        
     @SuppressWarnings({"unchecked"})
-    public <T extends Annotation> T getAnnotation( AnnotatedElement element,
+    public synchronized <T extends Annotation> T getAnnotation( AnnotatedElement element,
         Class<T> type ) {
         
         if (registrationFineDebug()) {
@@ -547,7 +522,7 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
         }
     }
     
-    public Pair<Class<?>,ClassAnalyzer> getClassAnalyzer( 
+    public synchronized Pair<Class<?>,ClassAnalyzer> getClassAnalyzer( 
         final Class<?> cls, 
         final Class<? extends Annotation> annotationClass ) {
 
@@ -560,7 +535,7 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
             ClassAnalyzer ca = new ClassAnalyzer( cls ) ;
 
             final Class<?> annotatedClass = Algorithms.getFirst( 
-                ca.findClasses( ca.forAnnotation( this, annotationClass ) ),
+                ca.findClasses( forAnnotation( annotationClass ) ),
                 "No " + annotationClass.getName() + " annotation found" ) ;
 
             if (registrationDebug()) {
@@ -572,7 +547,7 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
             final IncludeSubclass incsub = annotatedClass.getAnnotation( 
                 IncludeSubclass.class ) ;
             if (incsub != null) {
-                for (Class<?> klass : incsub.cls()) {
+                for (Class<?> klass : incsub.value()) {
                     classes.add( klass ) ;
                     if (registrationDebug()) {
                         dputil.info( "included subclass: " + klass ) ;
@@ -596,7 +571,7 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
         }
     }
     
-    public List<InheritedAttribute> getInheritedAttributes( 
+    public synchronized List<InheritedAttribute> getInheritedAttributes( 
         final ClassAnalyzer ca ) {        
         
         if (registrationDebug()) {
@@ -605,8 +580,8 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
         
         try {
             final Predicate<AnnotatedElement> pred = Algorithms.or( 
-                ca.forAnnotation( this, InheritedAttribute.class ),
-                ca.forAnnotation( this, InheritedAttributes.class ) ) ;
+                forAnnotation( InheritedAttribute.class ),
+                forAnnotation( InheritedAttributes.class ) ) ;
 
             // Construct list of classes annotated with InheritedAttribute or
             // InheritedAttributes.
@@ -631,7 +606,7 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
                         if (ia != null) {
                             result.add( ia ) ;
                         } else if (ias != null) {
-                            result.addAll( Arrays.asList( ias.attributes() )) ;
+                            result.addAll( Arrays.asList( ias.value() )) ;
                         }
 
                         return result ;
@@ -645,7 +620,124 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
         }
     }
     
-    public void setRegistrationDebug( 
+    private class ADHolder extends Holder<AttributeDescriptor> 
+        implements Predicate<InheritedAttribute> {
+        
+        private final Method method ;
+        
+        public ADHolder(  final Method method ) {
+            this.method = method ;
+        }
+        
+        public boolean evaluate( InheritedAttribute ia ) {
+            AttributeDescriptor ad = AttributeDescriptor.makeFromInherited( 
+                ManagedObjectManagerImpl.this, method,
+                ia.id(), ia.methodName(), ia.description() ) ;
+            boolean result = ad != null ;
+            if (result) {
+                content( ad ) ;
+            }
+            
+            return result ;
+        }
+    }
+    
+    private AttributeDescriptor getAttributeDescriptorIfInherited( 
+        final Method method, final List<InheritedAttribute> ias ) {
+        
+        ADHolder adh = new ADHolder( method ) ;
+        Algorithms.find( ias, adh ) ;
+        return adh.content() ;
+    }
+
+    public <K,V> void putIfNotPresent( final Map<K,V> map,
+        final K key, final V value ) {
+    
+        if (registrationFineDebug()) {
+            dputil.enter( "putIfNotPresent", "key=", key,
+                "value=", value ) ;
+        }
+        
+        try {
+            if (!map.containsKey( key )) {
+                if (registrationFineDebug()) {
+                    dputil.info( "Adding key, value to map" ) ;
+                }
+                map.put( key, value ) ;
+            } else {
+                if (registrationFineDebug()) {
+                    dputil.info( "Key,value already in map" ) ;
+                }
+            }
+        } finally {
+            if (registrationFineDebug()) {
+                dputil.exit() ;
+            }
+        }
+    }
+
+    // Returns a pair of maps defining all managed attributes in the ca.  The first map
+    // is all setters, and the second is all getters.  Only the most derived version is present.
+    public synchronized Pair<Map<String,AttributeDescriptor>,
+        Map<String,AttributeDescriptor>>
+        getAttributes( ClassAnalyzer ca ) {
+
+        if (registrationDebug()) {
+            dputil.enter( "getAttributes" ) ;
+        }
+
+        try {
+            final Map<String,AttributeDescriptor> getters = 
+                new HashMap<String,AttributeDescriptor>() ; 
+            final Map<String,AttributeDescriptor> setters = 
+                new HashMap<String,AttributeDescriptor>() ; 
+            final Pair<Map<String,AttributeDescriptor>,
+                Map<String,AttributeDescriptor>> result =  
+                    new Pair<Map<String,AttributeDescriptor>,
+                        Map<String,AttributeDescriptor>>( getters, setters ) ;
+            
+            final List<InheritedAttribute> ias = getInheritedAttributes( ca ) ;
+            
+            ca.findMethods( new Predicate<Method>() {
+                public boolean evaluate( Method method ) {
+                    ManagedAttribute ma = method.getAnnotation( 
+                        ManagedAttribute.class ) ;
+                    AttributeDescriptor ad = null ;
+                    if (ma == null) {
+                        ad = getAttributeDescriptorIfInherited( method, ias ) ;
+                    } else {
+                        Description desc = getAnnotation( method, Description.class ) ;
+                        String description ;
+                        if (desc == null) {
+                            description = "No description available for " + method.getName() ;
+                        } else {
+                            description = desc.value() ;
+                        }
+
+                        ad = AttributeDescriptor.makeFromAnnotated( ManagedObjectManagerImpl.this,
+                            method, ma.id(), description ) ;
+                    }
+                    
+                    if (ad != null) {
+                        if (ad.atype()==AttributeDescriptor.AttributeType.GETTER) {
+                            putIfNotPresent( getters, ad.id(), ad ) ;
+                        } else {
+                            putIfNotPresent( setters, ad.id(), ad ) ;
+                        }
+                    }
+                    
+                    return false ;
+                } } ) ;
+         
+            return result ;
+        } finally {
+            if (registrationDebug()) {
+                dputil.exit() ;
+            }
+        }
+    }
+
+    public synchronized void setRegistrationDebug( 
         ManagedObjectManager.RegistrationDebugLevel level ) {
         
         regDebugLevel = level ;
@@ -656,36 +748,47 @@ public class ManagedObjectManagerImpl implements ManagedObjectManagerInternal {
         }
     }
     
-    public void setRuntimeDebug( boolean flag ) {
+    public synchronized void setRuntimeDebug( boolean flag ) {
         runDebugFlag = flag ;
     }
     
-    public String dumpSkeleton( Object obj ) {
-        DynamicMBeanImpl impl = objectMBeanMap.get( obj ) ;
+    public synchronized String dumpSkeleton( Object obj ) {
+        MBeanImpl impl = tree.getMBeanImpl( obj ) ;
         if (impl == null) {
             return obj + " is not currently registered with mom " + this ;
         } else {
-            DynamicMBeanSkeleton skel = impl.skeleton() ;
+            MBeanSkeleton skel = impl.skeleton() ;
             String skelString = ObjectUtility.defaultObjectToString( skel ) ;
             return "Skeleton for MBean for object " + obj + ":\n"
                 + skelString ;
         }
     }
     
-    public boolean registrationDebug() {
+    public synchronized boolean registrationDebug() {
         return regDebugLevel == ManagedObjectManager.RegistrationDebugLevel.NORMAL 
             || regDebugLevel == ManagedObjectManager.RegistrationDebugLevel.FINE ;
     }
     
-    public boolean registrationFineDebug() {
+    public synchronized boolean registrationFineDebug() {
         return regDebugLevel == ManagedObjectManager.RegistrationDebugLevel.FINE ;
     }
     
-    public boolean runtimeDebug() {
+    public synchronized boolean runtimeDebug() {
         return runDebugFlag ;
     }
     
-    public void addTypePrefix( String arg ) {
+    public synchronized void addTypePrefix( String arg ) {
         typePrefixes.add( arg ) ;
     }
+    
+    public synchronized Predicate<AnnotatedElement> forAnnotation( 
+        final Class<? extends Annotation> annotation ) {
+
+        return new Predicate<AnnotatedElement>() {
+            public boolean evaluate( AnnotatedElement elem ) {
+                return getAnnotation( elem, annotation ) != null ;
+            }
+        } ;
+    }
+
 }
