@@ -37,7 +37,6 @@
 package org.glassfish.gmbal.impl ;
 
 import org.glassfish.gmbal.AMXMetadata;
-import org.glassfish.gmbal.generic.ClassAnalyzer;
 import java.util.List ;
 import java.util.Arrays ;
 import java.util.ArrayList ;
@@ -48,7 +47,6 @@ import java.util.HashSet ;
 import java.util.Iterator ;
 import java.util.concurrent.atomic.AtomicLong ;
 
-import java.lang.reflect.Method ;
 import java.lang.reflect.Type ;
 
 import javax.management.Attribute ;
@@ -75,10 +73,13 @@ import org.glassfish.gmbal.generic.DumpToString ;
 import org.glassfish.gmbal.generic.FacetAccessor;
 import javax.management.Descriptor;
 import javax.management.JMException;
-import javax.management.modelmbean.DescriptorSupport;
 import javax.management.modelmbean.ModelMBeanAttributeInfo;
 import javax.management.modelmbean.ModelMBeanInfoSupport;
 import javax.management.modelmbean.ModelMBeanOperationInfo;
+import org.glassfish.gmbal.typelib.EvaluatedClassAnalyzer;
+import org.glassfish.gmbal.typelib.EvaluatedClassDeclaration;
+import org.glassfish.gmbal.typelib.EvaluatedMethodDeclaration;
+import org.glassfish.gmbal.typelib.EvaluatedType;
 
 public class MBeanSkeleton {
     // Object evaluate( Object, List<Object> ) 
@@ -264,7 +265,7 @@ public class MBeanSkeleton {
         }
     }
 
-    private void analyzeAttributes( ClassAnalyzer ca ) {
+    private void analyzeAttributes( EvaluatedClassAnalyzer ca ) {
         if (mom.registrationFineDebug()) {
             dputil.enter( "analyzeAttributes", "ca=", ca ) ;
         }
@@ -306,14 +307,15 @@ public class MBeanSkeleton {
         }
     }
 
-    private void analyzeObjectNameKeys( ClassAnalyzer ca) {
+    private void analyzeObjectNameKeys( EvaluatedClassAnalyzer ca) {
         if (mom.registrationFineDebug()) {
             dputil.enter( "analyzeObjectNameKeys", "ca=", ca ) ;
         }
         
         try {
-            final List<Method> annotatedMethods = ca.findMethods(
-                mom.forAnnotation( ObjectNameKey.class, Method.class )) ;
+            final List<EvaluatedMethodDeclaration> annotatedMethods =
+                ca.findMethods( mom.forAnnotation( ObjectNameKey.class,
+                    EvaluatedMethodDeclaration.class )) ;
             
             if (annotatedMethods.size() == 0) {
                 return ;
@@ -321,16 +323,16 @@ public class MBeanSkeleton {
             
             // If there are two methods with @ObjectNameKey in the same
             // class, we have an error.
-            Method annotatedMethod = annotatedMethods.get(0) ;
+            EvaluatedMethodDeclaration annotatedMethod = annotatedMethods.get(0) ;
             if (annotatedMethods.size() > 1) {
-                Method second = annotatedMethods.get(1) ;
+                EvaluatedMethodDeclaration second = annotatedMethods.get(1) ;
                 
-                if (annotatedMethod.getDeclaringClass().equals(
-                    second.getDeclaringClass())) {
+                if (annotatedMethod.containingClass().equals(
+                    second.containingClass())) {
 
                     throw Exceptions.self.duplicateObjectNameKeyAttributes(
                         annotatedMethod, second,
-                        annotatedMethod.getDeclaringClass().getName() ) ;
+                        annotatedMethod.containingClass().name() ) ;
                 }
             } 
 
@@ -349,7 +351,7 @@ public class MBeanSkeleton {
     }
     
     private Pair<Operation,ModelMBeanOperationInfo> makeOperation(
-        final Method m ) {
+        final EvaluatedMethodDeclaration m ) {
 	
         if (mom.registrationFineDebug()) {
             dputil.enter( "makeOperation", "m=", m ) ;
@@ -357,19 +359,19 @@ public class MBeanSkeleton {
         
         try {
             final String desc = mom.getDescription( m ) ;
-            final Type rtype = m.getGenericReturnType() ;
+            final EvaluatedType rtype = m.returnType() ;
             final TypeConverter rtc = rtype == null ? null : mom.getTypeConverter( 
                 rtype ) ;
-            final Type[] atypes = m.getGenericParameterTypes() ;
+            final List<EvaluatedType> atypes = m.parameterTypes() ;
             final List<TypeConverter> atcs = new ArrayList<TypeConverter>() ;
             final ManagedOperation mo = mom.getAnnotation( m,
                 ManagedOperation.class ) ;
             
             Descriptor modelDescriptor = makeValidDescriptor(
-                DescriptorIntrospector.descriptorForElement( m ),
-                DescriptorType.operation, m.getName() ) ;
+                DescriptorIntrospector.descriptorForElement( m.element() ),
+                DescriptorType.operation, m.name() ) ;
 
-            for (Type ltype : atypes) {
+            for (EvaluatedType ltype : atypes) {
                 atcs.add( mom.getTypeConverter( ltype ) ) ;
             }
 
@@ -403,7 +405,7 @@ public class MBeanSkeleton {
                         dputil.info( "Before invoke: margs=", Arrays.asList( margs ) ) ;
                     }
 
-                    Object result = target.invoke( m, mom.runtimeDebug(),
+                    Object result = target.invoke( m.method(), mom.runtimeDebug(),
                         margs ) ;
 
                     if (mom.runtimeDebug()) {
@@ -418,7 +420,7 @@ public class MBeanSkeleton {
                 }
             } ;
 
-            final ParameterNames pna = m.getAnnotation( ParameterNames.class ) ;
+            final ParameterNames pna = m.annotation( ParameterNames.class ) ;
             if (mom.registrationFineDebug()) {
                 dputil.info( "pna=", pna.value() ) ;
             }
@@ -438,7 +440,7 @@ public class MBeanSkeleton {
             }
 
             final ModelMBeanOperationInfo operInfo =
-                new ModelMBeanOperationInfo( m.getName(),
+                new ModelMBeanOperationInfo( m.name(),
                 desc, paramInfo, rtc.getManagedType().toString(),
                 mo.impact().ordinal(), modelDescriptor ) ;
 
@@ -454,7 +456,7 @@ public class MBeanSkeleton {
         }
     }
 
-    private void analyzeOperations( ClassAnalyzer ca ) {
+    private void analyzeOperations( EvaluatedClassAnalyzer ca ) {
         if (mom.registrationFineDebug()) {
             dputil.enter( "analyzeOperations", "ca=", ca ) ;
         }
@@ -462,9 +464,9 @@ public class MBeanSkeleton {
         try {
             // Scan for all methods annotation with @ManagedOperation, 
             // including inherited methods.
-            final List<Method> ops = ca.findMethods( mom.forAnnotation( 
-                ManagedOperation.class, Method.class ) ) ;
-            for (Method m : ops) {             
+            final List<EvaluatedMethodDeclaration> ops = ca.findMethods( mom.forAnnotation(
+                ManagedOperation.class, EvaluatedMethodDeclaration.class ) ) ;
+            for (EvaluatedMethodDeclaration m : ops) {
                 final Pair<Operation,ModelMBeanOperationInfo> data =
                     makeOperation( m ) ;
                 final ModelMBeanOperationInfo info = data.second() ;
@@ -475,10 +477,10 @@ public class MBeanSkeleton {
                     dataTypes.add( pi.getType() ) ;
                 }
 
-                Map<List<String>,Operation> map = operations.get( m.getName() ) ;
+                Map<List<String>,Operation> map = operations.get( m.name() ) ;
                 if (map == null) {
                     map = new HashMap<List<String>,Operation>() ;
-                    operations.put( m.getName(), map ) ;
+                    operations.put( m.name(), map ) ;
                 }
 
                 // Note that the first occurrence of any method will be the most
@@ -515,18 +517,19 @@ public class MBeanSkeleton {
         DescriptorIntrospector.descriptorForElement(
             DefaultMBeanTypeHolder.class ) ;
 
-    public MBeanSkeleton( final Class<?> annotatedClass, 
-        final ClassAnalyzer ca, final ManagedObjectManagerInternal mom ) {
+    public MBeanSkeleton( final EvaluatedClassDeclaration annotatedClass,
+        final EvaluatedClassAnalyzer ca,
+        final ManagedObjectManagerInternal mom ) {
 
         dputil = new DprintUtil( getClass() ) ;
         this.mom = mom ;
         
-        mbeanType = annotatedClass.getAnnotation( AMXMetadata.class ) ;
+        mbeanType = mom.getAnnotation(annotatedClass, AMXMetadata.class ) ;
         if (mbeanType == null) {
             mbeanType = defaultMBeanType ;
         }
         
-        type = getTypeName( mbeanType, annotatedClass ) ;
+        type = getTypeName( mbeanType, annotatedClass.cls() ) ;
         sequenceNumber = new AtomicLong() ;
         setters = new HashMap<String,AttributeDescriptor>() ;
         getters = new HashMap<String,AttributeDescriptor>() ;
@@ -540,7 +543,7 @@ public class MBeanSkeleton {
 
         descriptor = makeValidDescriptor(
             DescriptorIntrospector.descriptorForElement(
-                annotatedClass ), DescriptorType.mbean, type ) ;
+                annotatedClass.cls() ), DescriptorType.mbean, type ) ;
 
         mbInfo = makeMbInfo( mom.getDescription( annotatedClass ) ) ;
     }
